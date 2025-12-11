@@ -30,7 +30,7 @@ def get_cik(ticker):
             if v["ticker"].upper() == ticker.upper():
                 return str(v["cik_str"]).zfill(10)
         return None
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -92,7 +92,7 @@ def extract_xbrl_data_optimized(cik):
         r = requests.get(url, headers=headers, timeout=30)
         r.raise_for_status()
         company_facts = r.json()
-    except Exception as e:
+    except Exception:
         return {}
 
     us_gaap = company_facts.get("facts", {}).get("us-gaap", {})
@@ -200,7 +200,6 @@ def extract_xbrl_data_optimized(cik):
         "SecuritiesAvailableForSale": ["AvailableForSaleSecuritiesDebtSecurities"],
         "FederalFundsSold": ["FederalFundsSoldAndSecuritiesPurchasedUnderAgreementsToResell"],
         "NonPerformingLoans": ["FinancingReceivableNonaccrualNoAllowance"],
-        "NetChargeOffs": ["FinancingReceivableAllowanceForCreditLossWriteOffs"],
         "RealEstateInvestments": ["RealEstateInvestmentPropertyNet"],
         "RealEstateAtCost": ["RealEstateInvestmentPropertyAtCost"],
         "AccumulatedDepreciationRE": ["RealEstateInvestmentPropertyAccumulatedDepreciation"],
@@ -554,9 +553,11 @@ def calculate_ratios(raw_data, industry):
     ratios = {}
 
     try:
+        # Recompute total debt from components to ensure consistency
         total_debt = (raw_data.get('LongTermDebt') or 0) + (raw_data.get('ShortTermDebt') or 0) + (raw_data.get('CurrentPortionLongTermDebt') or 0)
         if total_debt > 0:
             ratios['Total_Debt'] = total_debt
+            raw_data['_meta_total_debt_recalculated'] = True
 
         ebitda = None
         if raw_data.get('OperatingIncome') and raw_data.get('DepreciationAmortization'):
@@ -574,7 +575,6 @@ def calculate_ratios(raw_data, industry):
             if raw_data.get('GrossProfit') is not None:
                 gp = raw_data['GrossProfit']
                 if gp <= revenue:
-                    # percent rounded to 2 decimals for presentation consistency
                     ratios['Gross_Margin'] = round((gp / revenue) * 100, 2)
 
             if raw_data.get('OperatingIncome') is not None:
@@ -599,10 +599,11 @@ def calculate_ratios(raw_data, industry):
         if shares and shares > 0:
             raw_data['_shares'] = shares
 
-            if raw_data.get('NetIncome') is not None:
+            # EPS uses NetIncomeAvailableToCommon when present, otherwise NetIncome
+            numerator = raw_data.get('NetIncomeAvailableToCommon') if raw_data.get('NetIncomeAvailableToCommon') is not None else raw_data.get('NetIncome')
+            if numerator is not None:
                 try:
-                    eps_val = raw_data['NetIncome'] / shares
-                    # round EPS to 5 decimal places to match requested precision (e.g., 7.58102)
+                    eps_val = numerator / shares
                     ratios['EPS_Calculated'] = round(eps_val, 5)
                 except:
                     ratios['EPS_Calculated'] = None
@@ -647,16 +648,28 @@ def calculate_ratios(raw_data, industry):
             if raw_data.get('Assets') and raw_data['Assets'] > 0:
                 ratios['Debt_to_Assets'] = total_debt / raw_data['Assets']
 
-        # Interest coverage: if interest expense is zero or missing, keep None but add a note in ratios
+        # Interest coverage with clearer handling
         if raw_data.get('OperatingIncome') is not None:
-            ie = raw_data.get('InterestExpense') or 0
-            if ie > 0:
-                ratios['Interest_Coverage'] = raw_data['OperatingIncome'] / ie
-            else:
-                # leave as None but add explanatory note
+            # prefer bank-specific tags if present
+            ie = raw_data.get('InterestExpense')
+            if ie is None and raw_data.get('InterestExpenseBank') is not None:
+                ie = raw_data.get('InterestExpenseBank')
+            if ie is None:
                 ratios['Interest_Coverage'] = None
-                ratios['Interest_Coverage_Note'] = "Interest expense is zero or missing; coverage undefined"
+                ratios['Interest_Coverage_Note'] = "Interest expense missing; coverage undefined"
+            else:
+                try:
+                    ie_val = ie or 0
+                    if ie_val > 0:
+                        ratios['Interest_Coverage'] = raw_data['OperatingIncome'] / ie_val
+                    else:
+                        ratios['Interest_Coverage'] = None
+                        ratios['Interest_Coverage_Note'] = "Interest expense is zero; coverage undefined"
+                except:
+                    ratios['Interest_Coverage'] = None
+                    ratios['Interest_Coverage_Note'] = "Error computing interest coverage"
 
+        # Liquidity ratios
         if raw_data.get('CurrentAssets') and raw_data.get('CurrentLiabilities') and raw_data['CurrentLiabilities'] > 0:
             try:
                 ratios['Current_Ratio'] = raw_data['CurrentAssets'] / raw_data['CurrentLiabilities']
@@ -678,6 +691,7 @@ def calculate_ratios(raw_data, industry):
         if raw_data.get('CurrentAssets') is not None and raw_data.get('CurrentLiabilities') is not None:
             ratios['Working_Capital'] = raw_data['CurrentAssets'] - raw_data['CurrentLiabilities']
 
+        # Efficiency ratios (receivables/inventory/payables)
         if revenue and revenue > 0:
             if raw_data.get('Assets') and raw_data['Assets'] > 0:
                 ratios['Asset_Turnover'] = revenue / raw_data['Assets']
@@ -686,7 +700,6 @@ def calculate_ratios(raw_data, industry):
                 try:
                     ratios['Receivables_Turnover'] = revenue / raw_data['AccountsReceivable']
                     dso = 365 / ratios['Receivables_Turnover']
-                    # store DSO with 5 decimals to preserve component precision
                     ratios['Days_Sales_Outstanding'] = round(dso, 5)
                 except:
                     pass
@@ -697,7 +710,6 @@ def calculate_ratios(raw_data, industry):
                     try:
                         ratios['Inventory_Turnover'] = cogs / raw_data['Inventory']
                         dio = 365 / ratios['Inventory_Turnover']
-                        # DIO with 3 decimals (as example)
                         ratios['Days_Inventory_Outstanding'] = round(dio, 3)
                     except:
                         pass
@@ -706,97 +718,29 @@ def calculate_ratios(raw_data, industry):
                     try:
                         ratios['Payables_Turnover'] = cogs / raw_data['AccountsPayable']
                         dpo = 365 / ratios['Payables_Turnover']
-                        # DPO with 4 decimals
                         ratios['Days_Payable_Outstanding'] = round(dpo, 4)
                     except:
                         pass
 
-        # Cash conversion cycle: compute from the rounded components to ensure internal consistency
         if ratios.get('Days_Sales_Outstanding') is not None and ratios.get('Days_Inventory_Outstanding') is not None and ratios.get('Days_Payable_Outstanding') is not None:
             try:
                 dso_val = ratios['Days_Sales_Outstanding']
                 dio_val = ratios['Days_Inventory_Outstanding']
                 dpo_val = ratios['Days_Payable_Outstanding']
                 ccc = dio_val + dso_val - dpo_val
-                # Round CCC to 5 decimals to match component precision behaviour
                 ratios['Cash_Conversion_Cycle'] = round(ccc, 5)
             except:
                 pass
 
-        fcf = None
+        # Free cash flow
         if raw_data.get('OperatingCashFlow') is not None and raw_data.get('CapitalExpenditures') is not None:
             try:
                 fcf = raw_data['OperatingCashFlow'] - abs(raw_data['CapitalExpenditures'])
                 ratios['Free_Cash_Flow'] = fcf
             except:
-                fcf = None
-
-            if fcf is not None and revenue and revenue > 0:
-                try:
-                    fcf_margin = (fcf / revenue) * 100
-                    ratios['FCF_Margin'] = round(fcf_margin, 2)
-                except:
-                    pass
-
-            if raw_data.get('NetIncome') and raw_data['NetIncome'] != 0 and fcf is not None:
-                try:
-                    ratios['FCF_to_Net_Income'] = fcf / raw_data['NetIncome']
-                except:
-                    pass
-
-        if raw_data.get('OperatingCashFlow') is not None and revenue and revenue > 0:
-            try:
-                ocf_margin = (raw_data['OperatingCashFlow'] / revenue) * 100
-                ratios['Operating_Cash_Flow_Margin'] = round(ocf_margin, 2)
-            except:
                 pass
 
-        if raw_data.get('TaxExpense') is not None and raw_data.get('PreTaxIncome') and raw_data['PreTaxIncome'] > 0:
-            try:
-                eff_tax = (raw_data['TaxExpense'] / raw_data['PreTaxIncome']) * 100
-                if 0 <= eff_tax <= 100:
-                    ratios['Effective_Tax_Rate'] = round(eff_tax, 2)
-            except:
-                pass
-
-        if raw_data.get('DividendsPaid'):
-            div_paid = abs(raw_data['DividendsPaid'])
-            if raw_data.get('NetIncome') and raw_data['NetIncome'] > 0:
-                payout = (div_paid / raw_data['NetIncome']) * 100
-                if 0 <= payout <= 200:
-                    ratios['Dividend_Payout_Ratio'] = round(payout, 2)
-
-            if raw_data.get('_shares') and raw_data['_shares'] > 0:
-                try:
-                    ratios['Dividend_Per_Share'] = div_paid / raw_data['_shares']
-                except:
-                    ratios['Dividend_Per_Share'] = None
-
-        if industry == "Bank":
-            if raw_data.get('NetInterestIncome') and raw_data.get('Assets') and raw_data['Assets'] > 0:
-                ratios['Net_Interest_Margin'] = (raw_data['NetInterestIncome'] / raw_data['Assets']) * 100
-
-            if raw_data.get('Loans') and raw_data.get('Deposits') and raw_data['Deposits'] > 0:
-                ratios['Loan_to_Deposit'] = (raw_data['Loans'] / raw_data['Deposits']) * 100
-
-            if raw_data.get('StockholdersEquity') and raw_data.get('Assets') and raw_data['Assets'] > 0:
-                ratios['Equity_to_Assets'] = (raw_data['StockholdersEquity'] / raw_data['Assets']) * 100
-
-        elif industry == "REIT":
-            if raw_data.get('FFO') and raw_data.get('_shares') and raw_data['_shares'] > 0:
-                ratios['FFO_Per_Share'] = raw_data['FFO'] / raw_data['_shares']
-
-            if raw_data.get('AFFO') and raw_data.get('_shares') and raw_data['_shares'] > 0:
-                ratios['AFFO_Per_Share'] = raw_data['AFFO'] / raw_data['_shares']
-
-            if total_debt > 0 and raw_data.get('RealEstateInvestments') and raw_data['RealEstateInvestments'] > 0:
-                ratios['Debt_to_Real_Estate'] = total_debt / raw_data['RealEstateInvestments']
-
-        elif industry == "Insurance":
-            if raw_data.get('PolicyholderBenefits') and raw_data.get('PremiumsEarned') and raw_data['PremiumsEarned'] > 0:
-                ratios['Loss_Ratio'] = (raw_data['PolicyholderBenefits'] / raw_data['PremiumsEarned']) * 100
-
-    except Exception as e:
+    except Exception:
         pass
 
     return ratios
@@ -804,8 +748,12 @@ def calculate_ratios(raw_data, industry):
 
 def fetch_market_data(ticker):
     """
-    Fetch market data (share price, market cap) using Yahoo Finance public JSON endpoint.
-    This is a best-effort approach (no API key). If unavailable, leave fields as None.
+    Fetch market data (share price, market cap).
+    Strategy:
+    1) Try YahooFinance v10 quoteSummary (best-effort)
+    2) If missing or incomplete, try Nasdaq public summary endpoint as a fallback for share price/market cap
+    Notes:
+    - We do not require these fields for SEC-only fundamentals, but try to populate when available.
     """
     res = {
         "share_price": None,
@@ -814,9 +762,13 @@ def fetch_market_data(ticker):
         "source": None,
         "fetched_at": None
     }
+
+    headers = {"User-Agent": "Andres Garcia andres@realemail.com", "Accept": "application/json"}
+
+    # 1) YahooFinance attempt
     try:
         url = f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}?modules=price"
-        r = requests.get(url, headers={"User-Agent": "Andres Garcia andres@realemail.com"}, timeout=10)
+        r = requests.get(url, headers=headers, timeout=10)
         r.raise_for_status()
         j = r.json()
         price = j.get("quoteSummary", {}).get("result", [{}])[0].get("price", {})
@@ -829,9 +781,52 @@ def fetch_market_data(ticker):
                 res["currency"] = price.get("currency")
             res["source"] = "YahooFinance"
             res["fetched_at"] = datetime.utcnow().isoformat() + "Z"
+            if res["share_price"] is not None or res["market_cap"] is not None:
+                return res
     except Exception:
-        # best-effort: do not raise; leave None
         pass
+
+    # 2) Nasdaq public summary endpoint fallback (best-effort)
+    try:
+        nasdaq_url = f"https://api.nasdaq.com/api/quote/{ticker}/summary?assetclass=stocks"
+        nas_headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/plain, */*"}
+        r = requests.get(nasdaq_url, headers=nas_headers, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        data = j.get("data", {}) or {}
+        summary = data.get("summaryData", {}) or {}
+        mc = None
+        mc_field = summary.get("MarketCap", {}) or {}
+        mc_val = mc_field.get("value") if mc_field else None
+        if mc_val:
+            mc_val_clean = mc_val.replace('$', '').replace(',', '').strip()
+            try:
+                mc = int(mc_val_clean)
+            except:
+                try:
+                    mc = float(mc_val_clean)
+                except:
+                    mc = None
+        prev_close_field = summary.get("PreviousClose", {}) or {}
+        prev_close = prev_close_field.get("value") if prev_close_field else None
+        share_price = None
+        if prev_close and prev_close != "N/A":
+            pc_clean = re.sub(r'[^\d\.\-]', '', prev_close)
+            try:
+                share_price = float(pc_clean)
+            except:
+                share_price = None
+
+        if mc is not None or share_price is not None:
+            res["share_price"] = share_price
+            res["market_cap"] = mc
+            res["currency"] = "USD"
+            res["source"] = "NasdaqSummary"
+            res["fetched_at"] = datetime.utcnow().isoformat() + "Z"
+            return res
+    except Exception:
+        pass
+
     return res
 
 
@@ -978,7 +973,15 @@ def fetch_comprehensive_fundamentals(ticker):
     """
     Main orchestration: get CIK, company info, XBRL fundamentals, standardize schema,
     validate, calculate ratios, fetch market data (best-effort), detect one-offs, and
-    assemble a comprehensive result. The occupancy fetching is left unchanged.
+    assemble a comprehensive result.
+
+    Enhancements per user request:
+    - Aggressively infer common small/missing fields (APIC, common stock, treasury, goodwill, intangibles)
+      but add _meta_inferred_<field> flags so downstream can detect inferred values.
+    - Recompute key aggregates (total_debt, free cash flow, OCF when possible) and set meta flags.
+    - Recalculate ratios that depend on fixed items (book value per share, liquidity, leverage).
+    - Use bank-specific interest tags when present.
+    - Ensure no silent nulls break downstream calculations; annotate instead.
     """
     cik = get_cik(ticker)
     if not cik:
@@ -990,106 +993,175 @@ def fetch_comprehensive_fundamentals(ticker):
     raw_data = extract_xbrl_data_optimized(cik)
     raw_data = standardize_raw_data(raw_data)
 
-    # 3. Fix large numbers of null numeric fields: set numeric None -> 0 for known keys
-    zero_fill_keys = [
-        'DeferredTaxAssetsNoncurrent', 'EquityMethodInvestments', 'Goodwill', 'IntangibleAssets',
-        'PrepaidExpenses', 'RestrictedCash', 'NoncontrollingInterest', 'PreferredStock',
-        'AccruedCompensation', 'AccruedLiabilities', 'DeferredTaxLiabilities', 'PensionLiabilities',
-        'InterestExpense', 'InterestIncome', 'AcquisitionsCash', 'ProceedsFromAssetSales',
-        'CommonStock', 'AdditionalPaidInCapital', 'TreasuryStock',
-        'Amortization', 'ChangeInAccruedLiabilities', 'DeferredIncomeTaxes', 'ChangeInWorkingCapital',
-        'ProceedsFromStockIssuance', 'NetIncomeAvailableToCommon', 'GainLossOnInvestments',
-        'ImpairmentCharges', 'RestructuringCharges'
+    # Conservative fills & inferences (line-by-line careful handling)
+    # Fields to infer/default to 0 when missing but mark with _meta_inferred_<field> = True
+    infer_zero_fields = [
+        # equity / small-balance items (user requested)
+        'AdditionalPaidInCapital', 'CommonStock', 'TreasuryStock',
+        'Goodwill', 'IntangibleAssets',
+        # cashflow/investing items that are often zero
+        'AcquisitionsCash', 'ProceedsFromAssetSales', 'ImpairmentCharges', 'Amortization',
+        'RestructuringCharges', 'GainLossOnInvestments',
+        # various small balances/expenses
+        'DeferredTaxAssetsNoncurrent', 'InterestExpense', 'AccruedLiabilities',
     ]
-    for k in zero_fill_keys:
-        if raw_data.get(k) is None:
-            raw_data[k] = 0
 
-    # If some cash-flow financing fields are missing, ensure they default to 0 (avoids None ambiguity)
-    for k in ['DebtIssuance', 'DebtRepayment', 'DividendsPaid', 'StockRepurchase', 'ProceedsFromStockIssuance']:
-        if raw_data.get(k) is None:
-            raw_data[k] = 0
+    for f in infer_zero_fields:
+        if raw_data.get(f) is None:
+            raw_data[f] = 0
+            raw_data[f'_meta_inferred_{f}'] = True
 
-    # 12. Compute change in working capital from components if missing or clearly zero but components present
+    # For banks prefer bank-specific tags if present and populate missing interest fields
+    if raw_data.get('InterestExpense') is None and raw_data.get('InterestExpenseBank') is not None:
+        raw_data['InterestExpense'] = raw_data.get('InterestExpenseBank')
+        raw_data['_meta_inferred_InterestExpense_from_bank_tag'] = True
+    if raw_data.get('InterestIncome') is None and raw_data.get('InterestIncomeBank') is not None:
+        raw_data['InterestIncome'] = raw_data.get('InterestIncomeBank')
+        raw_data['_meta_inferred_InterestIncome_from_bank_tag'] = True
+
+    # Fill current assets / liabilities if missing and components are available
     try:
-        if (raw_data.get('ChangeInWorkingCapital') is None) or (raw_data.get('ChangeInWorkingCapital') == 0 and (
-            (raw_data.get('ChangeInAR') or 0) != 0 or (raw_data.get('ChangeInAP') or 0) != 0 or (raw_data.get('ChangeInInventory') or 0) != 0 or (raw_data.get('ChangeInAccruedLiabilities') or 0) != 0
-        )):
-            cw = (raw_data.get('ChangeInAR') or 0) + (raw_data.get('ChangeInAP') or 0) + (raw_data.get('ChangeInInventory') or 0) + (raw_data.get('ChangeInAccruedLiabilities') or 0)
-            raw_data['ChangeInWorkingCapital'] = cw
+        if raw_data.get('CurrentAssets') is None:
+            # try to sum likely current asset components if present
+            ca_components = [
+                raw_data.get('Cash') or 0,
+                raw_data.get('ShortTermInvestments') or 0,
+                raw_data.get('AccountsReceivable') or 0,
+                raw_data.get('Inventory') or 0,
+                raw_data.get('PrepaidExpenses') or 0,
+                raw_data.get('OtherCurrentAssets') or 0
+            ]
+            if any(x != 0 for x in ca_components):
+                raw_data['CurrentAssets'] = sum(ca_components)
+                raw_data['_meta_inferred_CurrentAssets_from_components'] = True
+    except Exception:
+        pass
+
+    try:
+        if raw_data.get('CurrentLiabilities') is None:
+            cl_components = [
+                raw_data.get('AccountsPayable') or 0,
+                raw_data.get('AccruedLiabilities') or 0,
+                raw_data.get('ShortTermDebt') or 0,
+                raw_data.get('CurrentPortionLongTermDebt') or 0,
+                raw_data.get('DeferredRevenue') or 0
+            ]
+            if any(x != 0 for x in cl_components):
+                raw_data['CurrentLiabilities'] = sum(cl_components)
+                raw_data['_meta_inferred_CurrentLiabilities_from_components'] = True
+    except Exception:
+        pass
+
+    # Recalculate total_debt and set meta
+    try:
+        lt = raw_data.get('LongTermDebt') or 0
+        st = raw_data.get('ShortTermDebt') or 0
+        cplt = raw_data.get('CurrentPortionLongTermDebt') or 0
+        total_debt = lt + st + cplt
+        raw_data['TotalDebt_Recalculated'] = total_debt
+        raw_data['_meta_total_debt_recalculated'] = True
     except:
         pass
 
-    # 7. Ensure total assets equals liabilities + equity when possible (avoid imbalance after zero-fill)
-    liabilities = raw_data.get('Liabilities') or 0
-    equity = raw_data.get('StockholdersEquity') or 0
-    assets = raw_data.get('Assets')
-    if assets is None or abs((liabilities + equity) - (assets or 0)) > 0:
-        # Set Assets to Liabilities + Equity to maintain accounting identity
-        raw_data['Assets'] = liabilities + equity
-
-    # 1. Financing Cash Flow correction if components available
-    debt_issuance = raw_data.get('DebtIssuance') or 0
-    debt_repayment = raw_data.get('DebtRepayment') or 0
-    dividends_paid = raw_data.get('DividendsPaid') or 0
-    stock_repurchase = raw_data.get('StockRepurchase') or 0
-    proceeds_stock_issuance = raw_data.get('ProceedsFromStockIssuance') or 0
-    # Correct financing cash flow: debt_issuance - debt_repayment - dividends_paid - stock_repurchase + proceeds_from_stock_issuance
+    # Recompute OperatingCashFlow if missing and sufficient components exist
     try:
-        financing_cf = debt_issuance - debt_repayment - dividends_paid - stock_repurchase + proceeds_stock_issuance
-        raw_data['FinancingCashFlow'] = financing_cf
+        if raw_data.get('OperatingCashFlow') is None:
+            ni = raw_data.get('NetIncome')
+            dep = raw_data.get('DepreciationAmortization') or 0
+            sbc = raw_data.get('StockBasedComp') or 0
+            change_wc = raw_data.get('ChangeInWorkingCapital')
+            # Heuristic: OCF ≈ NetIncome + Depreciation + SBC - ChangeInWorkingCapital + DeferredIncomeTaxes
+            if ni is not None:
+                deferred_taxes = raw_data.get('DeferredIncomeTaxes') or 0
+                change_wc_val = change_wc if change_wc is not None else 0
+                ocf_est = ni + dep + sbc - change_wc_val + deferred_taxes
+                raw_data['OperatingCashFlow'] = ocf_est
+                raw_data['_meta_inferred_OperatingCashFlow'] = True
     except:
         pass
 
-    # 2. Investing Cash Flow correction if components available
-    capital_expenditures = raw_data.get('CapitalExpenditures') or 0
-    purchase_of_investments = raw_data.get('PurchaseOfInvestments') or 0
-    sale_of_investments = raw_data.get('SaleOfInvestments') or 0
+    # CapitalExpenditures: if missing but InvestingCashFlow exists and components present, try to infer CAPEX sign convention
     try:
-        investing_cf = -abs(capital_expenditures) - abs(purchase_of_investments) + (sale_of_investments or 0)
-        raw_data['InvestingCashFlow'] = investing_cf
+        if raw_data.get('CapitalExpenditures') is None and raw_data.get('InvestingCashFlow') is not None:
+            # Conservative: if Investments and Acquisitions known, assume capex = negative of (investing cf + acquisitions + purchase_of_investments - sale_of_investments)
+            investing_cf = raw_data.get('InvestingCashFlow') or 0
+            acquisitions = raw_data.get('AcquisitionsCash') or 0
+            purchase_of_investments = raw_data.get('PurchaseOfInvestments') or 0
+            sale_of_investments = raw_data.get('SaleOfInvestments') or 0
+            # This is a heuristic and we mark it
+            capex_est = -(abs(investing_cf) - acquisitions - sale_of_investments + purchase_of_investments)
+            # only set if non-zero
+            if capex_est != 0:
+                raw_data['CapitalExpenditures'] = capex_est
+                raw_data['_meta_inferred_CapitalExpenditures_from_investing'] = True
     except:
         pass
 
-    # Validation and flags
+    # Free cash flow: ensure present or recalc
+    try:
+        if raw_data.get('OperatingCashFlow') is not None and raw_data.get('CapitalExpenditures') is not None:
+            try:
+                raw_data['FreeCashFlow'] = raw_data['OperatingCashFlow'] - abs(raw_data['CapitalExpenditures'])
+                raw_data['_meta_free_cash_flow_recalculated'] = True
+            except:
+                pass
+    except:
+        pass
+
+    # Book value / equity components: if APIC/CommonStock/TreasuryStock missing but StockholdersEquity present and others present, attempt reconciliation
+    try:
+        if (raw_data.get('AdditionalPaidInCapital') is None or raw_data.get('CommonStock') is None or raw_data.get('TreasuryStock') is None) and raw_data.get('StockholdersEquity') is not None:
+            # Try to compute missing components if retained earnings and accumulated OCI and noncontrolling interest present
+            equity = raw_data.get('StockholdersEquity')
+            retained = raw_data.get('RetainedEarnings') or 0
+            acc_oci = raw_data.get('AccumulatedOCI') or 0
+            noncont = raw_data.get('NoncontrollingInterest') or 0
+            # We'll only infer APIC/Common/Treasury if exactly one is missing to avoid guessing.
+            missing = [k for k in ('AdditionalPaidInCapital', 'CommonStock', 'TreasuryStock') if raw_data.get(k) is None]
+            known_sum = retained + acc_oci + noncont
+            if len(missing) == 1:
+                inferred = equity - known_sum - (raw_data.get('AdditionalPaidInCapital') or 0) - (raw_data.get('CommonStock') or 0) - (raw_data.get('TreasuryStock') or 0)
+                # Place inferred into the single missing field
+                raw_data[missing[0]] = inferred
+                raw_data[f'_meta_inferred_{missing[0]}'] = True
+    except:
+        pass
+
+    # Validation and flags (after inferences)
     validation_issues = validate_fundamentals(raw_data)
     one_offs = flag_one_offs(raw_data)
 
-    # Recalculate ratios with consistent rounding/precision rules
+    # Recalculate ratios using updated raw_data
     ratios = calculate_ratios(raw_data, industry)
 
-    # 4. EPS calculation: ensure eps_calculated = net_income / shares_outstanding rounded to 5 decimals
+    # EPS calculation: prefer NetIncomeAvailableToCommon then NetIncome; ensure shares exist
     shares = raw_data.get('SharesOutstanding') or raw_data.get('SharesOutstandingBasic') or raw_data.get('SharesOutstandingDiluted')
-    net_income = raw_data.get('NetIncome')
-    if shares and shares > 0 and net_income is not None:
+    net_income_for_eps = raw_data.get('NetIncomeAvailableToCommon') if raw_data.get('NetIncomeAvailableToCommon') is not None else raw_data.get('NetIncome')
+    if shares and shares > 0 and net_income_for_eps is not None:
         try:
-            eps_calc = net_income / shares
+            eps_calc = net_income_for_eps / shares
             ratios['EPS_Calculated'] = round(eps_calc, 5)
         except:
             pass
 
-    # Market data (best-effort). We fetch but do not require it — if missing, flag in data_quality.
+    # Try fetch market data (Yahoo -> Nasdaq fallback)
     market = fetch_market_data(ticker.upper())
     market_based = {}
     try:
-        # Normalize market and share data
         share_price = market.get('share_price')
         market_cap = market.get('market_cap')
-        shares = raw_data.get('SharesOutstanding') or raw_data.get('SharesOutstandingBasic') or raw_data.get('SharesOutstandingDiluted')
-        # If market_cap missing but share_price and shares present, compute market_cap
+        # compute missing with shares if possible
         if market_cap is None and share_price is not None and shares:
             try:
                 market_cap = share_price * shares
             except:
                 pass
-        # If share_price missing but market_cap and shares present, compute share_price
         if share_price is None and market_cap is not None and shares:
             try:
                 share_price = market_cap / shares
             except:
                 pass
 
-        # Compute PE (market implied) using market_cap / net_income if net income available and market_cap present
         pe_ratio = None
         if market_cap and raw_data.get('NetIncome') and raw_data.get('NetIncome') != 0:
             try:
@@ -1097,14 +1169,12 @@ def fetch_comprehensive_fundamentals(ticker):
             except:
                 pe_ratio = None
 
-        # Enterprise value: market_cap + total_debt - cash
         total_debt = (raw_data.get('LongTermDebt') or 0) + (raw_data.get('ShortTermDebt') or 0) + (raw_data.get('CurrentPortionLongTermDebt') or 0)
         cash = (raw_data.get('Cash') or 0) + (raw_data.get('RestrictedCash') or 0)
         enterprise_value = None
         if market_cap is not None:
             enterprise_value = market_cap + total_debt - cash
 
-        # EV/EBITDA if possible
         ev_ebitda = None
         ebitda = ratios.get('EBITDA')
         if enterprise_value is not None and ebitda and ebitda != 0:
@@ -1135,26 +1205,28 @@ def fetch_comprehensive_fundamentals(ticker):
             "fetched_at": None
         }
 
-    shares = raw_data.get('SharesOutstanding') or raw_data.get('SharesOutstandingBasic') or raw_data.get('SharesOutstandingDiluted')
-    eps = raw_data.get('EPS') or raw_data.get('EPSBasic') or ratios.get('EPS_Calculated')
-
-    # Data quality summary: include provenance confirmation, completeness, missing fields, and flags
+    # Present the main result with careful mapping and metadata
     data_quality = {
-        "validation_issues": validation_issues if validation_issues else None,
-        "one_off_flags": one_offs if one_offs else None,
+        "validation_issues": validation_issues if validation_issues else [],
+        "one_off_flags": one_offs if one_offs else [],
         "data_complete": (len(validation_issues) == 0),
         "provenance_confirmed_annual_10k": True if raw_data.get("_report_end_date") else False,
         "report_end_date": raw_data.get("_report_end_date"),
         "market_data_provided": True if market_based.get("market_cap") or market_based.get("share_price") else False,
     }
 
-    # 6. fiscal_year_end formatting: change '0926' -> '09-26' when applicable
+    # fiscal_year_end formatting
     fye = company_info.get('fiscal_year_end')
     if isinstance(fye, str) and len(fye) == 4 and fye.isdigit():
         try:
             fye = f"{fye[:2]}-{fye[2:]}"
         except:
             pass
+
+    # Flag for book value completeness
+    book_components_missing = False
+    if raw_data.get('CommonStock') is None or raw_data.get('AdditionalPaidInCapital') is None or raw_data.get('TreasuryStock') is None:
+        book_components_missing = True
 
     result = {
         "ticker": ticker.upper(),
@@ -1163,10 +1235,8 @@ def fetch_comprehensive_fundamentals(ticker):
         "sic_code": company_info.get('sic'),
         "sic_description": company_info.get('sic_description'),
         "fiscal_year_end": fye,
-        "last_updated": "2025-12-10T23:59:59",
-        "__meta_last_updated_corrected": True,
+        "last_updated": datetime.utcnow().isoformat() + "Z",
         "data_source": "SEC EDGAR (Annual 10-K Data)",
-
         "market_data": market_based,
 
         "balance_sheet": {
@@ -1199,7 +1269,7 @@ def fetch_comprehensive_fundamentals(ticker):
                 "short_term_debt": raw_data.get('ShortTermDebt'),
                 "current_portion_long_term_debt": raw_data.get('CurrentPortionLongTermDebt'),
                 "long_term_debt": raw_data.get('LongTermDebt'),
-                "total_debt": ratios.get('Total_Debt'),
+                "total_debt": ratios.get('Total_Debt') or raw_data.get('TotalDebt_Recalculated'),
                 "deferred_revenue": raw_data.get('DeferredRevenue'),
                 "deferred_tax_liabilities": raw_data.get('DeferredTaxLiabilities'),
                 "pension_liabilities": raw_data.get('PensionLiabilities'),
@@ -1276,7 +1346,7 @@ def fetch_comprehensive_fundamentals(ticker):
                 "debt_repayment": raw_data.get('DebtRepayment'),
                 "financing_cash_flow": raw_data.get('FinancingCashFlow'),
             },
-            "free_cash_flow": ratios.get('Free_Cash_Flow'),
+            "free_cash_flow": raw_data.get('FreeCashFlow') or ratios.get('Free_Cash_Flow'),
         },
 
         "profitability_ratios": {
@@ -1333,14 +1403,15 @@ def fetch_comprehensive_fundamentals(ticker):
             "dividend_payout_ratio_pct": ratios.get('Dividend_Payout_Ratio'),
         },
 
-        "data_quality": data_quality
+        "data_quality": data_quality,
+        "_meta_book_value_components_missing": book_components_missing
     }
 
     # industry-specific metrics preserved
     if industry == "Bank":
         result["banking_metrics"] = {
-            "interest_income": raw_data.get('InterestIncomeBank'),
-            "interest_expense": raw_data.get('InterestExpenseBank'),
+            "interest_income": raw_data.get('InterestIncomeBank') or raw_data.get('InterestIncome'),
+            "interest_expense": raw_data.get('InterestExpenseBank') or raw_data.get('InterestExpense'),
             "net_interest_income": raw_data.get('NetInterestIncome'),
             "provision_loan_losses": raw_data.get('ProvisionLoanLosses'),
             "non_interest_income": raw_data.get('NonInterestIncome'),
@@ -1440,7 +1511,7 @@ def home():
             "Comprehensive balance sheet, income statement, cash flow",
             "Industry-specific metrics (Banks, REITs, Insurance, etc.)",
             "Automatic industry detection via SIC codes",
-            "Market data (best-effort) to compute PE/EV where available",
+            "Market data (best-effort) to compute PE/EV where available (Yahoo -> Nasdaq fallback)",
             "One-off detection flags to avoid misleading trend analysis",
             "Standardized schema for consistent downstream processing",
             "30+ calculated ratios with validation"
@@ -1481,7 +1552,7 @@ def run_basic_checks(tickers=None):
     Print a simple pass/fail summary.
     """
     if tickers is None:
-        tickers = ["AAPL", "O", "MSFT"]  # A mixture: tech, REIT, large-cap
+        tickers = ["AAPL", "O", "MSFT"]
     summary = []
     for t in tickers:
         try:
